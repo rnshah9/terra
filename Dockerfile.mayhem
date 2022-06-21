@@ -1,6 +1,6 @@
 ARG release=16.04
 
-FROM ubuntu:$release
+FROM ubuntu:$release as builder
 
 ARG llvm=6.0
 ARG threads=4
@@ -15,3 +15,12 @@ RUN apt-get update -qq && \
     cd /terra/build && \
     cmake -DCMAKE_INSTALL_PREFIX=/terra_install .. && \
     make install -j$threads
+
+RUN mkdir -p /deps
+RUN ldd /terra/build/bin/terra | tr -s '[:blank:]' '\n' | grep '^/' | xargs -I % sh -c 'cp % /deps;'
+
+FROM ubuntu:16.04 as package
+
+COPY --from=builder /deps /deps
+COPY --from=builder /terra/build/bin/terra /terra/build/bin/terra
+ENV LD_LIBRARY_PATH=/deps
