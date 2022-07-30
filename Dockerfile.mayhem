@@ -11,16 +11,12 @@ ENV CI 1 # skip CUDA tests
 COPY . /terra
 
 RUN apt-get update -qq && \
-    apt-get install -qq build-essential cmake git llvm-$llvm-dev libclang-$llvm-dev clang-$llvm libedit-dev libncurses5-dev zlib1g-dev libpfm4-dev && \
-    cd /terra/build && \
-    cmake -DCMAKE_INSTALL_PREFIX=/terra_install .. && \
+    apt-get install -qq build-essential cmake git llvm-$llvm-dev libclang-$llvm-dev clang-$llvm libedit-dev libncurses5-dev zlib1g-dev libpfm4-dev 
+RUN cd /terra/build && \
+    cmake -DCMAKE_INSTALL_PREFIX=/install .. && \
     make install -j$threads
 
-RUN mkdir -p /deps
-RUN ldd /terra/build/bin/terra | tr -s '[:blank:]' '\n' | grep '^/' | xargs -I % sh -c 'cp % /deps;'
-
-FROM ubuntu:16.04 as package
-
-COPY --from=builder /deps /deps
-COPY --from=builder /terra/build/bin/terra /terra/build/bin/terra
-ENV LD_LIBRARY_PATH=/deps
+FROM ubuntu:$release as package
+RUN apt-get update -qq && \
+    apt-get install -qq libedit-dev libffi-dev libtinfo-dev
+COPY --from=builder /install /install

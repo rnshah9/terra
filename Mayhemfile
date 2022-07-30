@@ -2,4 +2,4 @@ project: terra
 target: terra
 
 cmds:
-  - cmd: /terra/build/bin/terra @@
+  - cmd: /install/bin/terra @@
