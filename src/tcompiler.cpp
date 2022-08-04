@@ -271,9 +271,11 @@ int terra_inittarget(lua_State *L) {
     else
         TT->CPU = llvm::sys::getHostCPUName().str();
 
+#ifdef __x86_64__
     if (TT->CPU == "generic") {
         TT->CPU = "x86-64";
     }
+#endif
 
     if (!lua_isnil(L, 3))
         TT->Features = lua_tostring(L, 3);
@@ -807,9 +809,56 @@ struct CCallingConv {
     lua_State *L;
     terra_CompilerState *C;
     Types *Ty;
+    bool pass_struct_as_exploded_values;
+    bool return_empty_struct_as_void;
+    bool aarch64_cconv;
+    bool ppc64_cconv;
+    int ppc64_float_limit;
+    int ppc64_int_limit;
+    bool ppc64_count_used;
 
     CCallingConv(TerraCompilationUnit *CU_, Types *Ty_)
-            : CU(CU_), T(CU_->T), L(CU_->T->L), C(CU_->T->C), Ty(Ty_) {}
+            : CU(CU_),
+              T(CU_->T),
+              L(CU_->T->L),
+              C(CU_->T->C),
+              Ty(Ty_),
+              pass_struct_as_exploded_values(false),
+              return_empty_struct_as_void(false),
+              aarch64_cconv(false),
+              ppc64_cconv(false),
+              ppc64_float_limit(0),
+              ppc64_int_limit(0),
+              ppc64_count_used(false) {
+        auto Triple = CU->TT->tm->getTargetTriple();
+        switch (Triple.getArch()) {
+            case Triple::ArchType::amdgcn: {
+                return_empty_struct_as_void = true;
+                pass_struct_as_exploded_values = true;
+            } break;
+            case Triple::ArchType::aarch64:
+            case Triple::ArchType::aarch64_be: {
+                aarch64_cconv = true;
+                // Hack: we share code with the PPC64 cconv, so configure here.
+                ppc64_float_limit = 4;
+                ppc64_int_limit = 2;
+                ppc64_count_used = false;
+            } break;
+            case Triple::ArchType::ppc64:
+            case Triple::ArchType::ppc64le: {
+                ppc64_cconv = true;
+                ppc64_float_limit = 8;
+                ppc64_int_limit = 8;
+                ppc64_count_used = true;
+            } break;
+        }
+
+        switch (Triple.getOS()) {
+            case Triple::OSType::Win32: {
+                return_empty_struct_as_void = true;
+            } break;
+        }
+    }
 
     enum RegisterClass {
         C_NO_CLASS = 0,
@@ -823,6 +872,7 @@ struct CCallingConv {
         C_PRIMITIVE,      // passed without modifcation (i.e. any non-aggregate type)
         C_AGGREGATE_REG,  // aggregate passed through registers
         C_AGGREGATE_MEM,  // aggregate passed through memory
+        C_ARRAY_REG,      // aggregate passed through registers as an array
     };
 
     struct Argument {
@@ -850,7 +900,7 @@ struct CCallingConv {
             return 1;
         }
         int GetNumberOfTypesInParamList() {
-            if (C_AGGREGATE_REG == this->kind)
+            if (this->kind == C_AGGREGATE_REG)
                 return GetNumberOfTypesInParamList(this->cctype);
             return 1;
         }
@@ -941,7 +991,115 @@ struct CCallingConv {
     }
 #endif
 
-    Argument ClassifyArgument(Obj *type, int *usedfloat, int *usedint) {
+    void CountValuesPPC64(Type *t, bool &all_float, bool &all_double, int &n_elts,
+                          int64_t &align) {
+        StructType *st = dyn_cast<StructType>(t);
+        if (st) {
+            for (auto elt : st->elements()) {
+                CountValuesPPC64(elt, all_float, all_double, n_elts, align);
+            }
+            return;
+        }
+
+        ArrayType *at = dyn_cast<ArrayType>(t);
+        if (at) {
+            Type *elt = at->getElementType();
+            uint64_t sz = at->getNumElements();
+            for (uint64_t i = 0; i < sz; ++i) {
+                CountValuesPPC64(elt, all_float, all_double, n_elts, align);
+            }
+            return;
+        }
+
+        all_float = all_float && t->isFloatTy();
+        all_double = all_double && t->isDoubleTy();
+        n_elts++;
+        align = std::max(align,
+                         (int64_t)(CU->getDataLayout().getABITypeAlignment(t) * 8));
+    }
+
+    void MergeValuePPC64(Type *t, std::vector<Type *> &elements, int64_t &bits) {
+        StructType *st = dyn_cast<StructType>(t);
+        if (st) {
+            for (auto elt : st->elements()) {
+                MergeValuePPC64(elt, elements, bits);
+            }
+            return;
+        }
+
+        ArrayType *at = dyn_cast<ArrayType>(t);
+        if (at) {
+            Type *elt = at->getElementType();
+            uint64_t sz = at->getNumElements();
+            for (uint64_t i = 0; i < sz; ++i) {
+                MergeValuePPC64(elt, elements, bits);
+            }
+            return;
+        }
+
+        unsigned b = CU->getDataLayout().getTypeAllocSizeInBits(t);
+        int64_t align = CU->getDataLayout().getABITypeAlignment(t) * 8;
+        bits += b;
+        bits = (bits + align - 1) & (-align);  // Align to this type.
+        if (bits >= 64) {
+            elements.push_back(Type::getIntNTy(*CU->TT->ctx, 64));
+            bits -= 64;
+        }
+    }
+
+    Argument ClassifyAggPPC64(TType *t, int *usedint, bool isreturn) {
+        bool all_float = true;
+        bool all_double = true;
+        int n_elts = 0;
+        int64_t align = 0;
+        CountValuesPPC64(t->type, all_float, all_double, n_elts, align);
+
+        // Special cases: all-float or all-double up to N values via registers:
+        if (all_float && n_elts > 0 && n_elts <= ppc64_float_limit) {
+            *usedint += n_elts;
+            if (n_elts == 1) {
+                return Argument(C_AGGREGATE_REG, t,
+                                StructType::get(Type::getFloatTy(*CU->TT->ctx)));
+            } else {
+                auto at = ArrayType::get(Type::getFloatTy(*CU->TT->ctx), n_elts);
+                return Argument(C_ARRAY_REG, t, at);
+            }
+        }
+        if (all_double && n_elts > 0 && n_elts <= ppc64_float_limit) {
+            *usedint += n_elts;
+            if (n_elts == 1) {
+                return Argument(C_AGGREGATE_REG, t,
+                                StructType::get(Type::getDoubleTy(*CU->TT->ctx)));
+            } else {
+                auto at = ArrayType::get(Type::getDoubleTy(*CU->TT->ctx), n_elts);
+                return Argument(C_ARRAY_REG, t, at);
+            }
+        }
+
+        // Integer or mixed case:
+
+        // Can pack up to N registers, or 2 if this is a return. (A register is 64
+        // bits or 8 bytes.)
+        int sz = (CU->getDataLayout().getTypeAllocSize(t->type) + 7) / 8;
+        int limit = isreturn ? 2 : ppc64_int_limit;
+        if ((ppc64_count_used ? *usedint : 0) + sz <= limit) {
+            *usedint += sz;
+
+            // Pack arguments
+            std::vector<Type *> elements;
+            int64_t bits = 0;
+            MergeValuePPC64(t->type, elements, bits);
+            if (bits > 0) {
+                // Align to the biggest type we've seen.
+                elements.push_back(
+                        Type::getIntNTy(*CU->TT->ctx, (bits + align - 1) & (-align)));
+            }
+            return Argument(C_AGGREGATE_REG, t, StructType::get(*CU->TT->ctx, elements));
+        }
+        return Argument(C_AGGREGATE_MEM, t);
+    }
+
+    Argument ClassifyArgument(Obj *type, int *usedfloat, int *usedint, bool isreturn) {
         TType *t = Ty->Get(type);
 
         if (!t->type->isAggregateType()) {
@@ -953,10 +1111,12 @@ struct CCallingConv {
             return Argument(C_PRIMITIVE, t, usei1 ? Type::getInt1Ty(*CU->TT->ctx) : NULL);
         }
 
-        // On AMDGPU, can't pass through memory, need to always explode to registers.
-        bool is_amdgpu = strcmp(CU->TT->tm->getTarget().getName(), "amdgcn") == 0;
-        if (is_amdgpu) {
+        if (pass_struct_as_exploded_values) {
             return Argument(C_AGGREGATE_REG, t, t->type);
+        }
+
+        if (aarch64_cconv || ppc64_cconv) {
+            return ClassifyAggPPC64(t, usedint, isreturn);
         }
 
         int sz = CU->getDataLayout().getTypeAllocSize(t->type);
@@ -991,13 +1151,9 @@ struct CCallingConv {
         Obj returntype;
         ftype->obj("returntype", &returntype);
         int zero = 0;
-        info->returntype = ClassifyArgument(&returntype, &zero, &zero);
+        info->returntype = ClassifyArgument(&returntype, &zero, &zero, true);
 
-#ifndef _WIN32
-        // need this logic on AMDGPU as well
-        bool is_amdgpu = strcmp(CU->TT->tm->getTarget().getName(), "amdgcn") == 0;
-        if (is_amdgpu) {
-#endif
+        if (return_empty_struct_as_void) {
             // windows classifies empty structs as pass by pointer, but we need a return
             // value of unit (an empty tuple) to be translated to void. So if it is unit,
             // force the return value to be void by overriding the normal classification
@@ -1006,9 +1162,7 @@ struct CCallingConv {
                 info->returntype = Argument(C_AGGREGATE_REG, info->returntype.type,
                                             StructType::get(*CU->TT->ctx));
             }
-#ifndef _WIN32
         }
-#endif
 
         int nfloat = 0;
         int nint = info->returntype.kind == C_AGGREGATE_MEM
@@ -1019,7 +1173,7 @@ struct CCallingConv {
         for (int i = 0; i < N; i++) {
             Obj elem;
             params->objAt(i, &elem);
-            info->paramtypes.push_back(ClassifyArgument(&elem, &nfloat, &nint));
+            info->paramtypes.push_back(ClassifyArgument(&elem, &nfloat, &nint, false));
         }
         info->fntype = CreateFunctionType(info, ftype->boolean("isvararg"));
     }
@@ -1065,12 +1219,14 @@ struct CCallingConv {
     void addExtAttrIfNeeded(TType *t, FnOrCall *r, int idx, bool return_value = false) {
         if (!t->type->isIntegerTy() || t->type->getPrimitiveSizeInBits() >= 32) return;
         if (return_value) {
+            if (!aarch64_cconv) {
 #if LLVM_VERSION < 140
-            assert(idx == 0);
-            r->addAttribute(0, t->issigned ? Attribute::SExt : Attribute::ZExt);
+                assert(idx == 0);
+                r->addAttribute(0, t->issigned ? Attribute::SExt : Attribute::ZExt);
 #else
-            r->addRetAttr(t->issigned ? Attribute::SExt : Attribute::ZExt);
+                r->addRetAttr(t->issigned ? Attribute::SExt : Attribute::ZExt);
 #endif
+            }
         } else {
 #if LLVM_VERSION < 50
             r->addAttribute(idx, t->issigned ? Attribute::SExt : Attribute::ZExt);
@@ -1215,6 +1371,20 @@ struct CCallingConv {
                     Value *dest = B->CreateBitCast(v, Ptr(p->cctype, as));
                     EmitEntryAggReg(B, dest, p->cctype, ai);
                 } break;
+                case C_ARRAY_REG: {
+                    Value *scratch = CreateAlloca(B, p->cctype);
+                    unsigned as = scratch->getType()->getPointerAddressSpace();
+                    emitStoreAgg(B, p->cctype, &*ai, scratch);
+                    Value *casted = B->CreateBitCast(scratch, Ptr(p->type->type, as));
+                    emitStoreAgg(B, p->type->type,
+                                 B->CreateLoad(
+#if LLVM_VERSION >= 80
+                                         p->type->type,
+#endif
+                                         casted),
+                                 v);
+                    ++ai;
+                } break;
             }
         }
     }
@@ -1244,6 +1414,17 @@ struct CCallingConv {
                     result_type = type->getElementType(0);
                 } while ((type = dyn_cast<StructType>(result_type)));
             }
+            B->CreateRet(B->CreateLoad(
+#if LLVM_VERSION >= 80
+                    result_type,
+#endif
+                    result));
+        } else if (C_ARRAY_REG == kind) {
+            Value *dest = CreateAlloca(B, info->returntype.type->type);
+            unsigned as = dest->getType()->getPointerAddressSpace();
+            emitStoreAgg(B, info->returntype.type->type, result, dest);
+            ArrayType *result_type = cast<ArrayType>(info->returntype.cctype);
+            Value *result = B->CreateBitCast(dest, Ptr(result_type, as));
             B->CreateRet(B->CreateLoad(
 #if LLVM_VERSION >= 80
                     result_type,
@@ -1304,6 +1485,16 @@ struct CCallingConv {
                     Value *casted = B->CreateBitCast(scratch, Ptr(a->cctype, as));
                     EmitCallAggReg(B, casted, a->cctype, arguments);
                 } break;
+                case C_ARRAY_REG: {
+                    Value *scratch = CreateAlloca(B, a->type->type);
+                    unsigned as = scratch->getType()->getPointerAddressSpace();
+                    emitStoreAgg(B, a->type->type, actual, scratch);
+                    Value *casted = B->CreateBitCast(scratch, Ptr(a->cctype, as));
+                    EmitCallAggReg(B, casted, a->cctype, arguments);
+                } break;
+                default: {
+                    assert(!"unhandled argument kind");
+                } break;
             }
         }
 
@@ -1323,7 +1514,7 @@ struct CCallingConv {
             Value *aggregate;
             if (C_AGGREGATE_MEM == info.returntype.kind) {
                 aggregate = arguments[0];
-            } else {  // C_AGGREGATE_REG
+            } else if (C_AGGREGATE_REG == info.returntype.kind) {
                 aggregate = CreateAlloca(B, info.returntype.type->type);
                 unsigned as = aggregate->getType()->getPointerAddressSpace();
                 StructType *type = cast<StructType>(info.returntype.cctype);
@@ -1335,6 +1526,14 @@ struct CCallingConv {
                 }
                 if (info.returntype.GetNumberOfTypesInParamList() > 0)
                     B->CreateStore(call, casted);
+            } else if (C_ARRAY_REG == info.returntype.kind) {
+                aggregate = CreateAlloca(B, info.returntype.type->type);
+                unsigned as = aggregate->getType()->getPointerAddressSpace();
+                ArrayType *type = cast<ArrayType>(info.returntype.cctype);
+                Value *casted = B->CreateBitCast(aggregate, Ptr(type, as));
+                emitStoreAgg(B, type, call, casted);
+            } else {
+                assert(!"unhandled argument kind");
             }
             return B->CreateLoad(
 #if LLVM_VERSION >= 80
@@ -1378,8 +1577,14 @@ struct CCallingConv {
                 rt = Type::getVoidTy(*CU->TT->ctx);
                 arguments.push_back(Ptr(info->returntype.type->type));
             } break;
+            case C_ARRAY_REG: {
+                rt = info->returntype.cctype;
+            } break;
             case C_PRIMITIVE: {
                 rt = info->returntype.cctype;
+            } break;
+            default: {
+                assert(!"unhandled argument kind");
             } break;
         }
 
@@ -1394,6 +1599,12 @@ struct CCallingConv {
                     break;
                 case C_AGGREGATE_REG: {
                     GatherArgumentsAggReg(a->cctype, arguments);
+                } break;
+                case C_ARRAY_REG: {
+                    arguments.push_back(a->cctype);
+                } break;
+                default: {
+                    assert(!"unhandled argument kind");
                 } break;
             }
         }

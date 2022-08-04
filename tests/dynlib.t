@@ -41,7 +41,7 @@ if ffi.os ~= "Windows" then
       libext = ".dylib"
     end
 
-    local libname = "terra"..libext
+    local libname = "libterra"..libext
 
     local flags = terralib.newlist {"-Wl,-rpath,"..libpath,libpath.."/"..libname}
     local lua_lib = libpath.."/".."libluajit-5.1"..libext
@@ -49,9 +49,6 @@ if ffi.os ~= "Windows" then
       flags:insert(lua_lib)
     end
     print(flags:concat(" "))
-    if ffi.os == "OSX" then
-        flags:insertall {"-pagezero_size","10000", "-image_base", "100000000"}
-    end
 
     terralib.saveobj("dynlib",{main = main},flags)
 

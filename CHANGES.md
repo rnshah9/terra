@@ -1,4 +1,74 @@
-# Release 1.0.0 (????-??-??)
+# Release 1.0.4 (2022-07-08)
+
+This release stabilizes support for PPC64le. On POWER9 hardware, Terra
+now passes 100% of the test suite. This comes with one large caveat:
+Terra relies on Moonjit, a fork of LuaJIT, for support for PPC64le. At
+the time of this release, Moonjit is currently unsupported. Therefore,
+while Terra provides comprehensive support for PPC64le, we are not in
+a position to fix issues in the Moonjit implementation.
+
+## Improvements
+
+  * Fixes for multiple issues on PPC64le, allowing Terra to pass 100%
+    of the test suite.
+
+# Release 1.0.3 (2022-07-01)
+
+This release contains no feature changes, but includes bug fixes for
+the Terra calling convention on PPC64le for passing arrays by value.
+
+## Improvements
+
+  * Fixes for the Terra calling convention on PPC64le for passing
+    arrays by value.
+
+# Release 1.0.2 (2022-06-25)
+
+This release includes improvements to make Terra better match Unix-like system
+conventions, as well as substantial improvements to C calling convention
+conformance on PPC64le.
+
+## Changed behaviors
+
+  * Terra historically installed its shared library as `terra.so` or
+    `terra.dylib` on Unix-like systems. This is for compatibility with Lua,
+    which allows a module be loaded as `require("terra")` if `terra.so` (or
+    `terra.dylib`, depending on the system) is present. However, this
+    conflicts with the Unix standard of having libraries prefixed with
+    `lib`. In this release, Terra installs its shared library as `libterra.so`
+    or `libterra.dylib`, and installs a symlink for `terra.so` or
+    `terra.dylib` for backwards compatibility. (Behavior on Windows and with
+    static libraries is unchanged.)
+
+## Improvements
+
+  * Substantially improved C calling convention conformance on PPC64le, along
+    with a new conformance test that matches behavior against C for all
+    primitive types (`uint8`, `int16`, `int32`, ...) and structs/arrays of
+    those types, up to a bound. Successfully tested on POWER9 hardware up to
+    `N` = 23. Current test suite pass rate on this hardware is 98.5%.
+
+# Release 1.0.1 (2022-06-13)
+
+This release includes no major Terra changes, but upgrades the LuaJIT
+dependency and makes available (experimental) binaries for ARM64 and
+PPC64le.
+
+## Changed behaviors
+
+  * The default Lua has been set back to LuaJIT for all platforms other than
+    PPC64le (where it is still set to Moonjit). As before, this can be
+    configured explicitly with the CMake flag `-DTERRA_LUA` with either
+    `luajit` or `moonjit`
+
+## Experimental features added
+
+  * Binary builds for ARM64 and PPC64le. These platforms were already possible
+    to build from source, but this makes them easier to try out. Note the test
+    suite pass rate is about 96% for ARM64 and 98% for PPC64le. You mileage
+    may vary depending on what features of Terra you use
+
+# Release 1.0.0 (2022-06-08)
 
 This release recognizes what has already been true for quite some
 time: Terra is mature and has been tested in a variety of production

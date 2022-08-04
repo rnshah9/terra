@@ -220,8 +220,6 @@ add_dependencies(TerraLibrary LLVMObjectFiles)
 add_dependencies(TerraLibraryShared LuaJIT)
 add_dependencies(TerraLibraryShared LLVMObjectFiles)
 
-set_target_properties(TerraLibraryShared PROPERTIES PREFIX "")
-
 set_target_properties(TerraLibrary PROPERTIES OUTPUT_NAME terra_s)
 set_target_properties(TerraLibraryShared PROPERTIES OUTPUT_NAME terra)
 
@@ -257,6 +255,30 @@ if(WIN32)
   target_link_options(TerraLibraryShared
     PRIVATE
       ${TERRA_EXPORTS}
+  )
+endif()
+
+# Lua expects Terra to generate an unprefixed terra.so/dylib.
+if(NOT CMAKE_SHARED_LIBRARY_PREFIX STREQUAL "")
+  add_custom_command(
+    OUTPUT "${PROJECT_BINARY_DIR}/lib/terra${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    DEPENDS
+      TerraLibraryShared
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "${CMAKE_SHARED_LIBRARY_PREFIX}terra${CMAKE_SHARED_LIBRARY_SUFFIX}" "terra${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/lib
+    VERBATIM
+  )
+
+  add_custom_target(
+    TerraLibrarySymlink
+    ALL
+    DEPENDS
+      "${PROJECT_BINARY_DIR}/lib/terra${CMAKE_SHARED_LIBRARY_SUFFIX}"
+  )
+
+  install(
+    FILES "${PROJECT_BINARY_DIR}/lib/terra${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}
   )
 endif()
 
@@ -305,13 +327,6 @@ target_compile_definitions(TerraExecutable
 )
 
 if(APPLE)
-  set_target_properties(TerraExecutable
-    PROPERTIES
-      # Makes LuaJIT happy (otherwise luaL_newstate returns NULL). Has to be
-      # set as a property otherwise target_link_libraries thinks the arguments
-      # are libraries.
-      LINK_FLAGS "-pagezero_size 10000 -image_base 100000000"
-  )
   target_link_libraries(TerraExecutable
     PRIVATE
       -Wl,-force_load,$<TARGET_LINKER_FILE:TerraLibrary>

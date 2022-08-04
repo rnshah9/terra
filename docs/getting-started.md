@@ -861,24 +861,25 @@ We've already seen examples of Lua code calling Terra functions. In general, you
 
 More examples are in `tests/luabridge*.t`.
 
-It is also possible to call Lua functions from Terra. Again, the translation from Terra objects to Lua uses LuaJITs conversion rules. Primitive types like `double` will be converted to their respective Lua type, while aggregate and derived types will be boxed in a LuaJIT `ctype` that can be modified from Lua:
+It is also possible to call Lua functions from Terra. Again, the translation from Terra objects to Lua uses LuaJITs conversion rules. Primitive types like `double` will be converted to their respective Lua type, while aggregate and derived types will be boxed in a LuaJIT `ctype` that can be modified from Lua. Note that the function `add1` must be cast explicitly, as otherwise Terra cannot determine the type of its arguments.
 
     function add1(a)
         a.real = a.real + 1
     end
     struct Complex { real : double, imag : double }
+    tadd1 = terralib.cast({&Complex}->{},add1)
     terra doit()
-        var a : Complex = {1,2}
-        add1(&a)
+        var a = Complex {1,2}
+        tadd1(&a)
         return a
     end
     a = doit()
-    print(a.real,a.imag) -- 2    1
+    print(a.real,a.imag) -- 2    2
     print(type(a)) -- cdata
 
 The file `tests/terralua.t` includes more examples. The file `tests/terraluamethod.t` also demonstrate using Lua functions inside the method table of a terra object.
 
-since we cannot determine the Terra types that function will return, Lua functions do not return values to Terra functions by default. To convert a Lua function into a Terra function that does return a value, you first need to `cast` it to a Terra function type:
+The `cast` syntax can also be used to declare the return type of the Lua function, as shown below.
 
     function luaadd(a,b) return a + b end
     terraadd = terralib.cast( {int,int} -> int, luaadd)
@@ -1237,14 +1238,11 @@ This program can then be compiled by linking against the Terra library
 
     # Linux
     c++ simple.cpp -o simple -I<path-to-terra-folder>/terra/include \
-    -L<path-to-terra-folder>/lib -lterra -ldl -pthread
+    -L<path-to-terra-folder>/lib -lterra_s -ldl -pthread
 
     # OSX
     c++ simple.cpp -o simple -I<path-to-terra-folder>/terra/include \
-    -L<path-to-terra-folder>/lib -lterra \
-    -pagezero_size 10000 -image_base 100000000
-
-Note the extra `pagezero_size` and `image_base` arguments on OSX. These are necessary for LuaJIT to run on OSX.
+    -L<path-to-terra-folder>/lib -lterra_s
 
 In addition to these modes, Terra code can be compiled to `.o` files which can be linked into an executable, or even compiled to an executable directly.
 
