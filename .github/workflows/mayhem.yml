@@ -51,7 +51,8 @@ jobs:
       fail-fast: false
       matrix:
         mayhemfile:
-          - mayhem/Mayhemfile
+          - mayhem/Mayhemfile_treadnumber
+          - mayhem/Mayhemfile_terra
 
     steps:
       - uses: actions/checkout@v2

@@ -1,0 +1,7 @@
+project: terra
+target: treadnumber
+
+cmds:
+  - cmd: /fuzz_treadnumber
+    max_length: 100
+    libfuzzer: true
